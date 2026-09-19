@@ -26,8 +26,13 @@ from .envelope import (
     monoisotopic_mass,
     top_peaks,
 )
-from .identify import predict_ion_candidate, score_ion_candidate
+from .identify import (
+    IonCandidatePrediction,
+    predict_ion_candidate,
+    score_ion_candidate,
+)
 from .isotopes import ISOTOPES
+from .mixture import fit_ion_mixture
 from .parser import FormulaError, LabelError, parse_formula, parse_label
 
 
@@ -49,7 +54,9 @@ app = FastAPI(
         "formulas, with optional pure-isotope labels such as [13C]; also "
         "estimates single-isotope enrichment by fitting candidate "
         "abundances against observed peaks, or jointly fits two isotopes of "
-        "different elements on a 2-D abundance grid."
+        "different elements on a 2-D abundance grid; can also score "
+        "candidate adduct/charge ions against observed m/z peaks and fit "
+        "two-ion mixtures over candidate pairs and mixing ratios."
     ),
     lifespan=lifespan,
 )
@@ -340,6 +347,99 @@ class IonIdentifyRequest(BaseModel):
         max_length=20,
         description="1-20 candidate adduct/charge combinations to score",
     )
+
+
+class IonMixtureFitRequest(BaseModel):
+    formula: str = Field(
+        ...,
+        description="Neutral molecular formula, e.g. 'C6H12O6' or 'C6H6[13C]2'",
+        examples=["C6H12O6"],
+    )
+    peaks: list[ObservedMzPeak] = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Observed m/z peaks, 1-200 entries, sorted by strictly increasing m/z",
+    )
+    mass_tolerance: float = Field(
+        ...,
+        gt=0,
+        description=(
+            "m/z tolerance used both to fuse superposed peaks and to pair "
+            "the mixed spectrum with the observed peaks"
+        ),
+    )
+    candidates: list[IonCandidateSpec] = Field(
+        ...,
+        min_length=2,
+        max_length=10,
+        description="2-10 candidate adduct/charge combinations; each valid unordered pair is mixed",
+    )
+    step_percent: float = Field(
+        1.0,
+        ge=0.5,
+        le=10.0,
+        description="Mixing-ratio grid step in percentage points (0.5-10)",
+    )
+
+
+class IonMixtureCandidateOut(BaseModel):
+    index: int = Field(..., description="0-based position of the candidate in the request")
+    valid: bool
+    adduct: str
+    charge: int
+    error: str | None = Field(
+        None, description="Machine-readable error code for invalid candidates"
+    )
+    message: str | None = Field(
+        None, description="Human-readable reason why the candidate is invalid"
+    )
+    position: int | None = Field(
+        None, description="0-based character position in the adduct string"
+    )
+
+
+class IonMixtureBestOut(BaseModel):
+    first_index: int = Field(
+        ..., description="0-based request index of the first candidate in the pair"
+    )
+    second_index: int = Field(
+        ..., description="0-based request index of the second candidate in the pair"
+    )
+    first_adduct: str
+    first_charge: int
+    second_adduct: str
+    second_charge: int
+    first_fraction_percent: float = Field(
+        ..., description="Share (percent) of the first candidate in the best mixture"
+    )
+    mse: float
+
+
+class IonMixtureComboOut(IonMixtureBestOut):
+    rank: int = Field(..., description="1-based rank over all valid candidate pairs")
+    pair_count: int
+    pairs: list[IonCandidatePairOut]
+
+
+class IonMixtureFitResponse(BaseModel):
+    formula: str
+    mass_tolerance: float
+    step_percent: float
+    observed_peak_count: int
+    valid_candidate_count: int
+    combination_count: int = Field(
+        ..., description="Number of valid unordered candidate pairs scored"
+    )
+    grid_points: int = Field(
+        ..., description="Mixing-ratio points tried per candidate pair (0-100% step)"
+    )
+    search_points: int = Field(
+        ..., description="Total scored (pair, ratio) combinations"
+    )
+    candidates: list[IonMixtureCandidateOut]
+    combinations: list[IonMixtureComboOut]
+    best_mixture: IonMixtureBestOut | None = None
 
 
 @app.exception_handler(FormulaError)
@@ -734,4 +834,138 @@ def ion_identify(req: IonIdentifyRequest) -> dict:
         "observed_peak_count": len(observed),
         "candidates": candidates,
         "best_candidate": best,
+    }
+
+
+@app.post("/api/v1/ion-mixture-fit", response_model=IonMixtureFitResponse)
+def ion_mixture_fit(req: IonMixtureFitRequest) -> dict:
+    """Fit two-ion mixtures against observed m/z peaks.
+
+    Every valid candidate reuses the ionic envelope computation of
+    ``/api/v1/ion-envelope`` (each envelope base-peak normalised to 100).
+    Each unordered pair of distinct valid candidates is mixed over a
+    0-100% grid for the first candidate's share: per-envelope intensities
+    are scaled by the fractions, within-tolerance superposed peaks are
+    fused and the mixture is base-peak normalised again, then paired
+    one-to-one with the observed (also base-peak normalised) peaks using
+    the same greedy nearest-mass matching, including unmatched peaks on
+    both sides in the MSE. Each pair keeps its best ratio (ties to the
+    lower ratio); pairs are ranked by MSE with the smaller candidate
+    index pair as tie-break. Invalid candidates are reported in place and
+    excluded from every pair; with fewer than two valid candidates the
+    best mixture is null.
+    """
+    parsed = parse_formula(req.formula)
+
+    observed = [(p.mz, p.intensity) for p in req.peaks]
+    validate_observed_peaks(observed)
+    obs = normalise_base_peak(observed)
+
+    candidate_out: list[dict] = []
+    predictions: list[tuple[int, IonCandidatePrediction]] = []
+    for idx, spec in enumerate(req.candidates):
+        try:
+            prediction = predict_ion_candidate(
+                parsed,
+                spec.adduct,
+                spec.charge,
+                settings.merge_tolerance,
+                settings.prune_threshold,
+            )
+        except AdductError as exc:
+            # Bad candidates are part of the 200 response (with their index
+            # and the existing position-aware error), and take part in no
+            # candidate pair.
+            candidate_out.append(
+                {
+                    "index": idx,
+                    "valid": False,
+                    "adduct": spec.adduct,
+                    "charge": spec.charge,
+                    "error": "invalid_adduct",
+                    "message": exc.message,
+                    "position": exc.position,
+                }
+            )
+            continue
+        candidate_out.append(
+            {
+                "index": idx,
+                "valid": True,
+                "adduct": spec.adduct,
+                "charge": spec.charge,
+                "error": None,
+                "message": None,
+                "position": None,
+            }
+        )
+        predictions.append((idx, prediction))
+
+    combinations: list[dict] = []
+    best_mixture: dict | None = None
+    grid_points = 0
+    if len(predictions) >= 2:
+        ranked, grid_points = fit_ion_mixture(
+            predictions,
+            obs,
+            step_percent=req.step_percent,
+            mass_tolerance=req.mass_tolerance,
+        )
+        specs_by_index = {idx: spec for idx, spec in enumerate(req.candidates)}
+        for rank, score in enumerate(ranked, start=1):
+            first_spec = specs_by_index[score.first_index]
+            second_spec = specs_by_index[score.second_index]
+            pairs = _build_mz_pairs(obs, score.pairs, score.predicted)
+            combo = {
+                "rank": rank,
+                "first_index": score.first_index,
+                "second_index": score.second_index,
+                "first_adduct": first_spec.adduct,
+                "first_charge": first_spec.charge,
+                "second_adduct": second_spec.adduct,
+                "second_charge": second_spec.charge,
+                "first_fraction_percent": round(score.first_fraction_percent, 6),
+                "mse": score.mse,
+                "pair_count": len(pairs),
+                "pairs": pairs,
+            }
+            combinations.append(combo)
+        winner = combinations[0]
+        best_mixture = {
+            key: winner[key]
+            for key in (
+                "first_index",
+                "second_index",
+                "first_adduct",
+                "first_charge",
+                "second_adduct",
+                "second_charge",
+                "first_fraction_percent",
+                "mse",
+            )
+        }
+
+    combination_count = len(combinations)
+    db.log_request(
+        req.formula,
+        None,
+        ok=bool(combinations),
+        message=(
+            f"ion mixture fit: {len(predictions)} valid, "
+            f"{len(candidate_out) - len(predictions)} invalid candidates, "
+            f"{combination_count} pairs"
+        ),
+    )
+    return {
+        "formula": req.formula,
+        "mass_tolerance": req.mass_tolerance,
+        "step_percent": req.step_percent,
+        "observed_peak_count": len(observed),
+        "valid_candidate_count": len(predictions),
+        "combination_count": combination_count,
+        "grid_points": grid_points,
+        "search_points": combination_count * grid_points,
+        "candidates": candidate_out,
+        "combinations": combinations,
+        "best_mixture": best_mixture,
     }

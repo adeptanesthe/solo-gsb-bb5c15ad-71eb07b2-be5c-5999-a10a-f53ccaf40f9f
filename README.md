@@ -224,6 +224,106 @@ curl -X POST http://localhost:8000/api/v1/ion-identify \
        "candidates":[{"adduct":"+H","charge":1},{"adduct":"+Na-H","charge":1}]}'
 ```
 
+### `POST /api/v1/ion-mixture-fit`
+
+在一个中性分子式上枚举 **2～10 个候选加合物/电荷** 的两两混合：每个有效候选复用 `/api/v1/ion-envelope` 的离子包络计算并各自按基峰归一化（基峰 = 100）；对每一对不同的有效候选，在首候选占比 0%～100% 的比例网格上构造混合谱，将混合谱与观测 m/z 峰用与 `/api/v1/ion-identify` 相同的一对一配对（含双侧未匹配峰）评分，返回最佳组合、全部有效组合排名、比例、MSE 与最佳配对明细。
+
+混合谱的构造（对首候选占比 p、次候选占比 100%−p）：
+
+1. 两个包络**保持各自的基峰归一化**（基峰 = 100），强度分别乘以 p/100 与 (100−p)/100 后叠加；
+2. 叠加后质量差小于 `mass_tolerance` 的峰用既有峰合并规则融合（质量取强度加权平均、强度求和）；
+3. 融合后的混合谱**再次按基峰归一化**（基峰 = 100）。端点 p=0%/100% 时占比为 0 的一侧不贡献峰，混合谱退化为另一候选的单包络；
+4. 混合谱与同样按基峰归一化的观测峰做容差内一对一贪心配对，未匹配的观测峰以预测强度 0 计、未匹配的预测峰以观测强度 0 计，MSE 为全部配对强度差平方的均值。候选包络不经 `top_n` 截断（卷积剪枝阈值仍然生效）。
+
+请求体：
+
+```json
+{
+  "formula": "C6H12O6",
+  "peaks": [
+    {"mz": 181.070665, "intensity": 100.0},
+    {"mz": 182.07402, "intensity": 6.49},
+    {"mz": 203.0526, "intensity": 28.0}
+  ],
+  "mass_tolerance": 0.01,
+  "candidates": [
+    {"adduct": "+H", "charge": 1},
+    {"adduct": "+Na-H", "charge": 1},
+    {"adduct": "+2H", "charge": 2}
+  ],
+  "step_percent": 5.0
+}
+```
+
+- `formula`（必填）：中性分子式，规则同 `/api/v1/ion-envelope`（可含 `[13C]` 等纯同位素标记）。
+- `peaks`（必填，**1～200 个**）：观测 m/z 峰，规则同 `/api/v1/ion-identify`（严格递增、强度非负且至少一个为正），评分前按基峰归一化为 100。
+- `mass_tolerance`（必填，>0）：m/z 容差，**同时**用于混合谱叠加时的峰融合与混合谱/观测峰的配对。
+- `candidates`（必填，**2～10 个**）：候选加合物/电荷组合，字段与校验（`adduct` 语法、`charge` 为 ±1～±10）同 `/api/v1/ion-identify`。枚举范围为每两个**不同的有效候选**构成的无序对，即 n 个有效候选对应 C(n,2) 个组合。
+- `step_percent`（可选，默认 1.0，范围 0.5～10）：首候选混合比例的网格步长（百分点），候选点为 0、step、2·step、…、100（100% 端点始终包含）。
+
+平局规则：同一候选对内不同比例的 MSE 相同（浮点噪声以内）时取**较低的首候选比例**（网格按升序访问）；不同候选对之间 MSE 相同时取**较小的候选索引对**（按 `(首候选索引, 次候选索引)` 字典序，索引对始终满足首索引 < 次索引）。
+
+响应：
+
+```json
+{
+  "formula": "C6H12O6",
+  "mass_tolerance": 0.01,
+  "step_percent": 5.0,
+  "observed_peak_count": 3,
+  "valid_candidate_count": 3,
+  "combination_count": 3,
+  "grid_points": 21,
+  "search_points": 63,
+  "best_mixture": {
+    "first_index": 0,
+    "second_index": 1,
+    "first_adduct": "+H",
+    "first_charge": 1,
+    "second_adduct": "+Na-H",
+    "second_charge": 1,
+    "first_fraction_percent": 70.0,
+    "mse": 12.34
+  },
+  "combinations": [
+    {
+      "rank": 1,
+      "first_index": 0,
+      "second_index": 1,
+      "first_adduct": "+H",
+      "first_charge": 1,
+      "second_adduct": "+Na-H",
+      "second_charge": 1,
+      "first_fraction_percent": 70.0,
+      "mse": 12.34,
+      "pair_count": 6,
+      "pairs": [
+        {"observed_mz": 181.070665, "observed_intensity": 100.0, "predicted_mz": 181.070665, "predicted_intensity": 100.0},
+        {"observed_mz": null, "observed_intensity": null, "predicted_mz": 91.038971, "predicted_intensity": 3.1}
+      ]
+    }
+  ],
+  "candidates": [
+    {"index": 0, "valid": true, "adduct": "+H", "charge": 1, "error": null, "message": null, "position": null},
+    {"index": 1, "valid": false, "adduct": "-99H", "charge": -1, "error": "invalid_adduct", "message": "Adduct fragment would drive element 'H' count from 12 to -87; counts must not become negative", "position": 3}
+  ]
+}
+```
+
+- `best_mixture`：全部有效候选对中 MSE 最小的（候选对, 首候选比例）组合，给出两个候选的请求索引 `first_index`/`second_index`（前者较小）、加合物与电荷、`first_fraction_percent`（首候选占比百分比）与 `mse`；**有效候选少于两个时为 `null`**。
+- `combinations`：**全部有效候选对**的排名，按 MSE 升序、平局按较小索引对稳定排序；`rank` 从 1 开始。每项含与 `best_mixture` 相同的组合/比例/MSE 字段，以及该组合最佳比例下的 `pair_count` 与 `pairs` 配对明细（字段与排序规则同 `/api/v1/ion-identify`：按 m/z 升序插入未匹配预测峰，未匹配观测峰的 `predicted_*` 为 `null`，未匹配预测峰的 `observed_*` 为 `null`）。
+- `candidates`：**全部请求候选**的合法性结果（保持请求顺序），字段为 `index`/`valid`/`adduct`/`charge` 及非法时的 `error`（`invalid_adduct`）、`message`、`position`——与 `/api/v1/ion-identify` 完全相同的位置错误语义。**单个候选非法时返回其错误并跳过所有涉及该候选的组合**，不影响其他候选对评分，也不会导致整个请求 422。
+- `valid_candidate_count`：有效候选数；`combination_count` 为有效候选对数 C(n,2)；`grid_points` 为每对尝试的比例点数；`search_points = combination_count × grid_points` 为总评分点数。
+- 请求级非法输入（分子式非法、峰列表为空/非递增/全零强度、`mass_tolerance` 非正、候选数不在 2～10、候选电荷为 0 或超出 ±10、`step_percent` 越界、峰数超过 200 等）按既有规则返回 422。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/ion-mixture-fit \
+  -H 'Content-Type: application/json' \
+  -d '{"formula":"C6H12O6","mass_tolerance":0.01,"step_percent":5.0,
+       "peaks":[{"mz":181.0707,"intensity":100.0},{"mz":203.0526,"intensity":30.0}],
+       "candidates":[{"adduct":"+H","charge":1},{"adduct":"+Na-H","charge":1}]}'
+```
+
 ### `POST /api/v1/enrichment-fit`
 
 估计分子中单个同位素标记的丰度（富集度）：在 0%～100% 范围内按给定步长网格搜索候选丰度，对每个候选值复用卷积生成归一化包络，与观测峰配对比较，返回均方误差最小的丰度。
@@ -388,7 +488,7 @@ curl -X POST http://localhost:8000/api/v1/ion-identify \
 }
 ```
 
-  注意：`/api/v1/ion-identify` 对候选加合物**不**返回上述 422——非法候选以 `valid: false` 出现在 200 响应的 `candidates` 中，并携带其请求 `index` 与同一套 `error`/`message`/`position`；仅请求级输入（分子式、峰列表、参数边界）非法时才返回 422。
+  注意：`/api/v1/ion-identify` 与 `/api/v1/ion-mixture-fit` 对候选加合物**不**返回上述 422——非法候选以 `valid: false` 出现在 200 响应的 `candidates` 中，并携带其请求 `index` 与同一套 `error`/`message`/`position`；其中 mixture-fit 还会跳过所有涉及该候选的候选对（有效候选少于两个时 `best_mixture` 为 `null`）。仅请求级输入（分子式、峰列表、参数边界）非法时才返回 422。
 
 - `invalid_label`：标签非法——格式错误（应为 `13C` 形式）、未知元素符号、未知质量数（`position` 为标签字符串中的 0 基字符位置）。
 - `invalid_labels`：双标签组合非法——两个标签属于同一元素（`index` 为标签列表中出错标签的 0 基索引）。
@@ -426,6 +526,7 @@ pytest                                 # 运行测试
 - **峰合并**：排序后相邻质量差 < 0.0001 Da 的峰融合为一个，质量取强度加权平均，强度取和。
 - **离子包络**：`POST /api/v1/ion-envelope` 将加合物（`app/adduct.py`，形如 `+2H-H2O` 的连续片段，系数乘整个片段）施加到解析后的原子计数上，用 `|charge| × MSPC_MERGE_TOLERANCE` 的中性质量容差卷积，再按 `(mass − charge·mₑ)/|charge|`（`mₑ = 0.000548579909065 Da`）逐峰换算为 m/z。
 - **离子识别**：`POST /api/v1/ion-identify`（`app/identify.py`）对 1～20 个候选（加合物, 电荷）逐个复用同一套加合物解析、离子包络计算与基峰归一化，观测峰同样归一化一次后复用；每个候选用与富集拟合相同的 `pair_and_score` 做容差内质量差全局从小到大的一对一贪心匹配，未匹配峰以零强度计入归一化 MSE。有效候选按 MSE 升序、输入索引作稳定平局键排序；非法候选捕获既有 `AdductError`（携带位置）后以 `valid: false` 附在结果末尾，不影响其他候选评分。
+- **双离子混合拟合**：`POST /api/v1/ion-mixture-fit`（`app/mixture.py`）对 2～10 个候选（加合物, 电荷）复用离子识别的预测与归一化；枚举每个不同有效候选的无序对，在首候选 0%～100% 的比例网格上，将两个保持各自基峰归一化的包络按比例缩放叠加、用 `mass_tolerance` 经既有 `merge_peaks` 融合（强度加权均值质量、强度求和）后再次基峰归一化，再用同一套 `pair_and_score` 与观测峰一对一配对并把双侧未匹配峰计入 MSE。每对取网格上 MSE 最小的比例（浮点噪声内的平局取较低首候选比例），候选对再按 MSE 升序、较小索引对作平局键排名。非法候选返回其位置错误并跳过涉及它的全部组合；有效候选少于两个时无组合、最佳结果为空。
 - **单同位素质量**：按 IUPAC 惯例取各元素天然丰度最高的同位素质量之和。
 - **富集拟合**：对每个候选丰度 p（0%～100% 按步长网格搜索），将被标记元素的同位素分布替换为"标记同位素占 p、其余天然同位素按比例分享 1−p"，复用同一套卷积生成归一化包络（基峰=100，观测峰同样归一化）；观测峰与容差内最近的预测峰贪心配对，未匹配峰强度按 0 计，以全部配对的强度均方误差最小者为最佳丰度，同分取较低丰度。除被拟合元素外其余元素的包络与候选丰度无关，只计算一次。
 - **双元素联合拟合**：`POST /api/v1/dual-enrichment-fit` 在两个不同元素标签的丰度上做二维网格搜索，组合两种富集分布后沿用同一套卷积、一对一配对与含未匹配峰的 MSE。与两个候选丰度都无关的"其余元素包络"只卷积一次并在全网格复用；第一元素的富集多项式在其外层丰度固定时只计算一次。MSE 相同按两项丰度（请求顺序）升序字典序取解，`search_points` 为两网格点数之积。
